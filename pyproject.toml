@@ -5,7 +5,6 @@ description = "统一的 MCP 服务入口"
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=2.0.1,<3",
-    "pyjwt[crypto]>=2.10.1,<3",
 ]
 
 [tool.uv]
