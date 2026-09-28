@@ -80,7 +80,7 @@ class DynamicToolRegistry:
         if not access_token.subject:
             return self._error("当前 token 缺少最终用户身份")
 
-        print(f"access_token: {json.dumps(access_token)}")
+        print(f"access_token: {access_token.model_dump_json()}")
         try:
             Draft202012Validator(tool.input_schema).validate(arguments)
             result = await asyncio.to_thread(
