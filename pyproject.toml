@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "统一的 MCP 服务入口"
 requires-python = ">=3.12"
 dependencies = [
+    "jsonschema>=4.26,<5",
     "mcp>=2.0.1,<3",
 ]
 

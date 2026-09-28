@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode
 
-from mcp.server import MCPServer
+import uvicorn
+from mcp import types
+from mcp.server.auth.provider import ProviderTokenVerifier
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import (
     AccessToken,
@@ -20,13 +22,18 @@ from mcp.server.auth.provider import (
     construct_redirect_uri,
 )
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+from mcp.server.lowlevel import Server
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyHttpUrl, BaseModel
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.routing import Route
+
+from dynamic_tools import DynamicToolRegistry, ServiceCatalog
 
 
 STATE_FILE = Path(__file__).parent / ".runtime" / "oauth-state.json"
+TOOLS_FILE = Path(__file__).parent / ".runtime" / "tools.json"
 
 
 @dataclass(frozen=True)
@@ -39,6 +46,7 @@ class Settings:
     dev_users: tuple[str, ...]
     host: str
     port: int
+    downstream_allowed_hosts: frozenset[str]
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -67,6 +75,13 @@ class Settings:
             dev_users=dev_users,
             host=os.environ.get("MCP_HOST", "127.0.0.1"),
             port=int(os.environ.get("MCP_PORT", "8000")),
+            downstream_allowed_hosts=frozenset(
+                host.strip().lower()
+                for host in os.environ.get(
+                    "MCP_DOWNSTREAM_ALLOWED_HOSTS", "127.0.0.1,localhost"
+                ).split(",")
+                if host.strip()
+            ),
         )
 
 
@@ -315,32 +330,26 @@ class PersistentAuthorizationServerProvider(
 
 settings = Settings.from_env()
 provider = PersistentAuthorizationServerProvider(settings, STATE_FILE)
-mcp = MCPServer(
-    "MCP Gateway",
-    version="0.2.0",
-    auth_server_provider=provider,
-    auth=AuthSettings(
-        issuer_url=AnyHttpUrl(settings.issuer_url),
-        resource_server_url=AnyHttpUrl(settings.resource_url),
-        required_scopes=[settings.required_scope],
-        client_registration_options=ClientRegistrationOptions(
-            enabled=True,
-            valid_scopes=[settings.required_scope],
-            default_scopes=[settings.required_scope],
-        ),
-        validate_token_resource=True,
+tool_registry = DynamicToolRegistry(TOOLS_FILE, set(settings.downstream_allowed_hosts))
+auth_settings = AuthSettings(
+    issuer_url=AnyHttpUrl(settings.issuer_url),
+    resource_server_url=AnyHttpUrl(settings.resource_url),
+    required_scopes=[settings.required_scope],
+    client_registration_options=ClientRegistrationOptions(
+        enabled=True,
+        valid_scopes=[settings.required_scope],
+        default_scopes=[settings.required_scope],
     ),
+    validate_token_resource=True,
 )
 
 
-@mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(_: Request) -> JSONResponse:
     """提供无需认证的存活检查。"""
 
     return JSONResponse({"status": "ok"})
 
 
-@mcp.custom_route("/dev/authorize", methods=["GET", "POST"])
 async def dev_authorize(request: Request) -> HTMLResponse | RedirectResponse:
     """展示开发用户选择页，并把选中的用户绑定到授权码。"""
 
@@ -382,26 +391,89 @@ async def dev_authorize(request: Request) -> HTMLResponse | RedirectResponse:
     return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
 
-@mcp.tool()
-def whoami() -> dict[str, object]:
-    """返回当前 MCP 请求中已经验证的用户身份。"""
+async def register_tools(request: Request) -> JSONResponse:
+    """接收业务服务提交的完整工具目录。"""
+
+    # TODO: 当前只校验请求头是否存在；正式接入前需改为密钥比对或请求签名验证。
+    if "X-Tool-Registration-Token" not in request.headers:
+        return JSONResponse(
+            {"error": "缺少 X-Tool-Registration-Token 请求头"},
+            status_code=401,
+        )
+
+    try:
+        catalog = ServiceCatalog.model_validate(await request.json())
+        tool_names = tool_registry.replace_service_catalog(
+            request.path_params["service_name"], catalog
+        )
+    except (ValueError, json.JSONDecodeError) as error:
+        return JSONResponse({"error": str(error)}, status_code=400)
+    return JSONResponse({"count": len(tool_names), "tools": tool_names})
+
+
+async def list_tools(_, __) -> types.ListToolsResult:
+    """返回内置身份工具与运行时注册的业务工具。"""
+
+    return types.ListToolsResult(
+        tools=[
+            types.Tool(
+                name="whoami",
+                description="返回当前 MCP 请求中已经验证的用户身份。",
+                inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+                annotations=types.ToolAnnotations(readOnlyHint=True),
+            ),
+            *tool_registry.list_tools(),
+        ]
+    )
+
+
+async def call_tool(_, params: types.CallToolRequestParams) -> types.CallToolResult:
+    """执行内置工具，或将动态工具调用转发给业务服务。"""
 
     access_token = get_access_token()
     if access_token is None:
-        raise RuntimeError("当前请求缺少已验证的用户身份")
+        return types.CallToolResult(
+            content=[types.TextContent(text="当前请求缺少已验证的用户身份")],
+            isError=True,
+        )
 
-    return {
-        "issuer": (access_token.claims or {}).get("iss"),
-        "user_id": access_token.subject,
-        "client_id": access_token.client_id,
-        "scopes": access_token.scopes,
-    }
+    if params.name == "whoami":
+        result = {
+            "issuer": (access_token.claims or {}).get("iss"),
+            "user_id": access_token.subject,
+            "client_id": access_token.client_id,
+            "scopes": access_token.scopes,
+        }
+        return types.CallToolResult(
+            content=[types.TextContent(text=json.dumps(result, ensure_ascii=False))],
+            structuredContent=result,
+        )
+    return await tool_registry.call_tool(params.name, params.arguments or {}, access_token)
+
+
+mcp = Server(
+    "MCP Gateway",
+    version="0.3.0",
+    on_list_tools=list_tools,
+    on_call_tool=call_tool,
+)
+app = mcp.streamable_http_app(
+    json_response=True,
+    host=settings.host,
+    auth=auth_settings,
+    token_verifier=ProviderTokenVerifier(provider),
+    auth_server_provider=provider,
+    custom_starlette_routes=[
+        Route("/healthz", healthz, methods=["GET"]),
+        Route("/dev/authorize", dev_authorize, methods=["GET", "POST"]),
+        Route(
+            "/internal/services/{service_name}/tools",
+            register_tools,
+            methods=["PUT"],
+        ),
+    ],
+)
 
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="streamable-http",
-        host=settings.host,
-        port=settings.port,
-        json_response=True,
-    )
+    uvicorn.run(app, host=settings.host, port=settings.port)
