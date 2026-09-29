@@ -1,0 +1,60 @@
+openapi: 3.0.3
+
+info:
+  title: Image Detection API
+  version: 1.0.0
+
+servers:
+  - url: http://adc6a403b34a546beb89eace1672998a-693756402.us-east-1.elb.amazonaws.com:8000
+
+paths:
+  /v1/recognition/image_debug:
+    post:
+      operationId: detectObjsFromImage
+      summary: 识别图像中包含的目标
+      description: 从图像中识别所有支持的目标。
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - verify_gun
+                - event_id
+                - image_key
+                - image_base64
+                - labels
+                - ori_model
+                - gun_error_policy
+              properties:
+                verify_gun:
+                  type: bool
+                  description: 是否针对枪支进行复检。固定传 true 即可
+                event_id:
+                  type: string
+                  description: 事件ID，默认取当前时间戳即可
+                image_key:
+                  type: string
+                  description: 图片key。默认取当前时间戳即可   
+                image_base64:
+                  type: string
+                  description: 图片的base64编码，将用户提供的图片编码后获得
+                labels:
+                  type: array
+                  description: 要检测的目标列表，支持用户选择并传入的有 枪支(gun),危险动物(bear),人形(person)，传入的数据为目标英文名数组, 如 ["gun","person"]
+                ori_model:
+                  type: string
+                  description: 固定传 ai_bench_test
+                gun_error_policy:
+                  type: string
+                  description:固定传 remove
+      responses:
+        "200":
+          description: 从图片中识别到的目标
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
